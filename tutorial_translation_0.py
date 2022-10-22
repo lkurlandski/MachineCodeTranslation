@@ -28,10 +28,8 @@ from typing import Iterable, List
 
 # We need to modify the URLs for the dataset since the links to the original dataset are broken
 # Refer to https://github.com/pytorch/text/issues/1756#issuecomment-1163664163 for more info
-multi30k.URL[
-    "train"] = "https://raw.githubusercontent.com/neychev/small_DL_repo/master/datasets/Multi30k/training.tar.gz"
-multi30k.URL[
-    "valid"] = "https://raw.githubusercontent.com/neychev/small_DL_repo/master/datasets/Multi30k/validation.tar.gz"
+multi30k.URL["train"] = "https://raw.githubusercontent.com/neychev/small_DL_repo/master/datasets/Multi30k/training.tar.gz"
+multi30k.URL["valid"] = "https://raw.githubusercontent.com/neychev/small_DL_repo/master/datasets/Multi30k/validation.tar.gz"
 
 SRC_LANGUAGE = 'de'
 TGT_LANGUAGE = 'en'
