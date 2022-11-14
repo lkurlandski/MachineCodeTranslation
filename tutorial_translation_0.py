@@ -20,6 +20,7 @@ This tutorial shows:
 #
 # To access torchtext datasets, please install torchdata following instructions at https://github.com/pytorch/data.
 #
+import sys
 
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
@@ -52,7 +53,8 @@ def yield_tokens(data_iter: Iterable, language: str) -> List[str]:
     language_index = {SRC_LANGUAGE: 0, TGT_LANGUAGE: 1}
 
     for data_sample in data_iter:
-        yield token_transform[language](data_sample[language_index[language]])
+        s = data_sample[language_index[language]]
+        yield token_transform[language](s)
 
 
 # Define special symbols and indices
