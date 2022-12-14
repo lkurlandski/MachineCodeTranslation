@@ -17,13 +17,16 @@ import math
 
 import torch
 from torch import Tensor
-import torch.nn as nn
+from torch import nn
+
+import cfg
 
 
 class PositionalEncoding(nn.Module):
     """
     Helper Module that adds positional encoding to the token embedding to introduce a notion of word order.
     """
+
     def __init__(self, emb_size: int, dropout: float, maxlen: int = 5000):
         super(PositionalEncoding, self).__init__()
         den = torch.exp(-torch.arange(0, emb_size, 2) * math.log(10000) / emb_size)
@@ -37,15 +40,14 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pos_embedding", pos_embedding)
 
     def forward(self, token_embedding: Tensor) -> Tensor:
-        return self.dropout(
-            token_embedding + self.pos_embedding[: token_embedding.size(0), :]
-        )
+        return self.dropout(token_embedding + self.pos_embedding[: token_embedding.size(0), :])
 
 
 class TokenEmbedding(nn.Module):
     """
     Helper Module to convert tensor of input indices into corresponding tensor of token embeddings.
     """
+
     def __init__(self, vocab_size: int, emb_size):
         super(TokenEmbedding, self).__init__()
         self.embedding = nn.Embedding(vocab_size, emb_size)
@@ -59,14 +61,22 @@ class Seq2SeqTransformer(nn.Module):
     """
     Seq2Seq2 network.
     """
+
+    EMB_SIZE = 256
+    NHEAD = 4
+    FFN_HID_DIM = 256
+    BATCH_SIZE = 4
+    NUM_ENCODER_LAYERS = 2
+    NUM_DECODER_LAYERS = 2
+
     def __init__(
         self,
-        num_encoder_layers: int,
-        num_decoder_layers: int,
-        emb_size: int,
-        nhead: int,
         src_vocab_size: int,
         tgt_vocab_size: int,
+        num_encoder_layers: int = 3,
+        num_decoder_layers: int = 3,
+        emb_size: int = 512,
+        nhead: int = 8,
         dim_feedforward: int = 512,
         dropout: float = 0.1,
     ):
@@ -109,11 +119,29 @@ class Seq2SeqTransformer(nn.Module):
         return self.generator(outs)
 
     def encode(self, src: Tensor, src_mask: Tensor):
-        return self.transformer.encoder(
-            self.positional_encoding(self.src_tok_emb(src)), src_mask
-        )
+        return self.transformer.encoder(self.positional_encoding(self.src_tok_emb(src)), src_mask)
 
     def decode(self, tgt: Tensor, memory: Tensor, tgt_mask: Tensor):
         return self.transformer.decoder(
             self.positional_encoding(self.tgt_tok_emb(tgt)), memory, tgt_mask
         )
+
+
+def create_square_mask(sz: int) -> Tensor:
+    """Create a square subsequence mask."""
+    mask = (torch.triu(torch.ones((sz, sz), device=cfg.device)) == 1).transpose(0, 1)
+    mask = mask.float().masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, float(0.0))
+    return mask
+
+
+def create_mask(src: Tensor, tgt: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Create a mask for the attention mechanism"""
+    src_seq_len = src.shape[0]
+    tgt_seq_len = tgt.shape[0]
+
+    tgt_mask = create_square_mask(tgt_seq_len)
+    src_mask = torch.zeros((src_seq_len, src_seq_len), device=cfg.device).type(torch.bool)
+
+    src_padding_mask = (src == cfg.PAD_IDX).transpose(0, 1)
+    tgt_padding_mask = (tgt == cfg.PAD_IDX).transpose(0, 1)
+    return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
