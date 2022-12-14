@@ -131,11 +131,11 @@ class PseudoSupervisedDataset(IterableDataset):
         self.verbose = verbose
         self.error_mode = error_mode
 
-    def __len__(self):
-        return len(self.mal_df.index)
-
     def __iter__(self) -> tp.Generator[tp_ParInstr, None, None]:
         return self.stream_disassembly_snippets()
+
+    def est_len(self):
+        return len(self.mal_df.index)
 
     def stream_tokenized_delimited_snippets(
         self, delimiter: str = " "
@@ -154,22 +154,62 @@ class PseudoSupervisedDataset(IterableDataset):
             yield mal, ben
 
     def stream_disassembly_snippets(self) -> tp.Generator[tp_ParInstr, None, None]:
+        def mal_idx_valid():
+            return cur_mal_idx < len(self.mal_df.index)
+
+        def ben_idx_valid():
+            return cur_ben_idx < len(self.ben_df.index)
+
         cur_mal_file: str = ""  # Absolute path to the current file
         cur_ben_file: str = ""
         cur_mal_bytes: str = ""  # Bytes of the .text section for the current file
         cur_ben_bytes: str = ""
-        for (i, mal), (i, ben) in zip(self.mal_df.iterrows(), self.ben_df.iterrows()):
-            # Update the file and disassembly if the next snippet belongs to different file
-            cur_mal_file, cur_mal_bytes = self._update(mal["file"], cur_mal_file, cur_mal_bytes)
-            cur_ben_file, cur_ben_bytes = self._update(ben["file"], cur_ben_file, cur_ben_bytes)
-            # Select the proper section from the disassembly for the current file
-            mal_dis_snippet = self._get_snippet(cur_mal_file, cur_mal_bytes, int(mal["offset"]))
-            ben_dis_snippet = self._get_snippet(cur_ben_file, cur_ben_bytes, int(ben["offset"]))
-            # Raise error if the disassembly is empty
-            self._verify("mal", i, mal_dis_snippet, cur_mal_file, cur_mal_bytes, int(mal["offset"]))
-            self._verify("mal", i, ben_dis_snippet, cur_ben_file, cur_ben_bytes, int(ben["offset"]))
+        cur_mal_idx = 0  # Index within the rows of the dataframes
+        cur_ben_idx = 0
+
+        while mal_idx_valid() and ben_idx_valid():
+            mal_dis_snippet = None
+            ben_dis_snippet = None
+            # Search for a valid snippet of malicious disassembly
+            while (v := self._validate(mal_dis_snippet)) != 0 and mal_idx_valid():
+                # Current row in the dataframe
+                mal = self.mal_df.iloc[cur_mal_idx]
+                # Update the file and disassembly if the next snippet belongs to different file
+                cur_mal_file, cur_mal_bytes = self._update(mal["file"], cur_mal_file, cur_mal_bytes)
+                # Select the proper section from the disassembly for the current file
+                mal_dis_snippet = self._get_snippet(cur_mal_file, cur_mal_bytes, int(mal["offset"]))
+                # Next row
+                cur_mal_idx += 1
+
+            # Search for a valid snippet of benign disassembly
+            while (v := self._validate(ben_dis_snippet)) != 0 and ben_idx_valid():
+                # Current row in the dataframe
+                ben = self.ben_df.iloc[cur_ben_idx]
+                # Update the file and disassembly if the next snippet belongs to different file
+                cur_ben_file, cur_ben_bytes = self._update(ben["file"], cur_ben_file, cur_ben_bytes)
+                # Select the proper section from the disassembly for the current file
+                ben_dis_snippet = self._get_snippet(cur_ben_file, cur_ben_bytes, int(ben["offset"]))
+                # Next row
+                cur_ben_idx += 1
+
             # Yield malicious/benign disassembly
             yield mal_dis_snippet, ben_dis_snippet
+
+    def _validate(self, dis_snippet: tp_Instr) -> int:
+        if dis_snippet is None:
+            return 1
+        if len(dis_snippet) == 0:
+            return 2
+        # Check that more than one unique token exists in the instruction
+        tokens = set()
+        for instruction in dis_snippet:
+            tokens.update(Transform.tokenize_instruction(instruction))
+            if len(tokens) > 1:
+                break
+        else:
+            return 3
+        # Instruction looks good
+        return 0
 
     def _update(self, next_file: str, cur_file: str, cur_bytes: str) -> tp.Tuple[str, tp.List[str]]:
         if next_file != cur_file:
@@ -207,20 +247,18 @@ class Transform:
 
     pattern: tp.ClassVar[str] = r"([\s+\[\]\+\*\-,:])"
     vocab: Vocab
-    fn: tp.Callable[[tp.Iterable[tp_Instr]], Tensor]
 
     def __init__(self, vocab: Vocab) -> None:
         self.vocab = vocab
-        # TODO: do not flatten the instructions
-        self.fn = self.sequential_transforms(
-            self.tokenize_instructions,
-            self.vectorize_instructions,
-            self.flatten_iterable,
-            self.tensor_transform,
-        )
 
+    # TODO: should not flatten the instructions as this destroys meaning
     def __call__(self, sample: tp_Instrs) -> Tensor:
-        return self.fn(sample)
+        s = sample
+        s = self.tokenize_instructions(s)
+        s = self.vectorize_instructions(s)
+        s = self.flatten_iterable(s)
+        s = self.tensor_transform(s)
+        return s
 
     @staticmethod
     def sequential_transforms(*transforms: tp.Callable) -> tp.Callable[[str], tp.Any]:
@@ -296,7 +334,7 @@ class CollateFunction:
         return src_batch, tgt_batch
 
 
-def main():
+def test():
     from torch.utils.data import DataLoader
     from tqdm import tqdm
 
@@ -315,20 +353,15 @@ def main():
         text_section_bounds_file,
         chunk_size,
         split="all",
-        verbose=False,
-        error_mode="warn",
     )
     print(type(dataset))
 
-    # for mal, ben in tqdm(iter(dataset), total=len(dataset)):
-    #     mal_ben = mal + ben
-    #     #print(mal_ben)
-    # sys.exit()
-
-    loader = DataLoader(dataset)
-    for mal, ben in tqdm(loader):
+    iterable = iter(dataset)
+    iterable = tqdm(iterable, total=10788)
+    for mal, ben in iterable:
+        # print(f"{len(mal)=}, {len(ben)}")
         pass
 
 
 if __name__ == "__main__":
-    main()
+    test()

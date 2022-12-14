@@ -1,10 +1,11 @@
 """
 Train and evaluate the model.
 """
+
 from argparse import ArgumentParser
-from itertools import chain
 from pathlib import Path
 from pprint import pformat, pprint
+import shutil
 import sys
 from timeit import default_timer as timer
 import typing as tp
@@ -17,33 +18,36 @@ from torchtext.vocab import build_vocab_from_iterator, Vocab
 from tqdm import tqdm
 
 import cfg
-from data import CollateFunction, PseudoSupervisedDataset, Transform
+from data import CollateFunction, PseudoSupervisedDataset, tp_Instrs, Transform
 from network import create_mask, create_square_mask, Seq2SeqTransformer
 
 
-def get_vocab(tokens: tp.Iterable[str], min_frequency: int = 10, max_tokens: int = 100) -> Vocab:
+def get_vocab(tokens: tp.Iterable[str], min_frequency: int = 10, max_tokens: int = 1000) -> Vocab:
     """Get a vocabulary for each language.
 
     Sets UNK_IDX as the default index. This index is returned when the token is not found.
     If not set, it throws RuntimeError when the queried token is not found in the Vocabulary.
     """
     vocab_file = VOCAB_ROOT / f"{min_frequency}/{max_tokens}/vocab.pt"
+    if CLEAN:
+        vocab_file.unlink(missing_ok=True)
+
     if vocab_file.exists():
         print(f"Using saved vocabulary: {vocab_file}")
         vocab = torch.load(vocab_file)
-        return vocab
+    else:
+        print(f"Building & saving vocabulary: {vocab_file}")
+        vocab = build_vocab_from_iterator(
+            tokens,
+            min_freq=min_frequency,
+            specials=cfg.SPECIAL_SYMBOLS,
+            special_first=True,
+        )
+        vocab_file.parent.mkdir(exist_ok=True, parents=True)
+        vocab.set_default_index(cfg.UNK_IDX)
+        torch.save(vocab, vocab_file)
 
-    print("Building vocabulary")
-    vocab = build_vocab_from_iterator(
-        tokens,
-        min_freq=min_frequency,
-        specials=cfg.SPECIAL_SYMBOLS,
-        special_first=True,
-    )
-    vocab_file.parent.mkdir(exist_ok=True, parents=True)
-    vocab.set_default_index(cfg.UNK_IDX)
-    torch.save(vocab, vocab_file)
-
+    print(f"Vocab size: {len(vocab.get_itos())}")
     return vocab
 
 
@@ -122,35 +126,42 @@ def train(
 ) -> None:
     """Train the model."""
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9)
-    for epoch in tqdm(range(start, EPOCHS), start=start, total=EPOCHS):
-        start_time = timer()
+    for epoch in tqdm(range(start, EPOCHS), initial=start, total=EPOCHS):
+        s = timer()
         train_loss = train_epoch(
             model,
-            DataLoader(tr_dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn),
+            DataLoader(tr_dataset, BATCH_SIZE, collate_fn=collate_fn),
             optimizer,
             loss_fn,
-            epoch,
         )
+        tr_time = timer() - s
         torch.save(model.state_dict(), models_path / f"{epoch}.pt")
-        end_time = timer()
-        val_loss = evaluate(
-            model, DataLoader(vl_dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn), loss_fn
-        )
+        val_loss = -1
+        if EVAL_VL:
+            s = timer()
+            val_loss = evaluate(
+                model,
+                DataLoader(vl_dataset, BATCH_SIZE, collate_fn=collate_fn),
+                loss_fn,
+                vl_dataset.est_len,
+            )
+            vl_time = timer() - s
         print(
-            f"Epoch: {epoch}, Train loss: {train_loss:.3f}, Val loss: {val_loss:.3f}, "
-            f"Epoch time = {(end_time - start_time) / 60:.3f}min"
+            f"Completed epoch: {epoch}, "
+            f"Train loss: {train_loss:.3f}, "
+            f"Val loss: {val_loss:.3f}, "
+            f"Train time = {tr_time / 60:.3f}min, "
+            f"Validation time = {vl_time / 60:.3f}min"
         )
 
 
-def greedy_decode(
-    model: nn.Module, src: Tensor, src_mask: Tensor, max_len: int, start_symbol: int = cfg.BOS
-):
+def greedy_decode(model: nn.Module, src: Tensor, src_mask: Tensor, max_len: int):
     """Generate output sequence using greedy algorithm."""
     src = src.to(cfg.device)
     src_mask = src_mask.to(cfg.device)
 
     memory = model.encode(src, src_mask)
-    ys = torch.ones(1, 1).fill_(start_symbol).type(torch.long).to(cfg.device)
+    ys = torch.ones(1, 1).fill_(cfg.BOS_IDX).type(torch.long).to(cfg.device)
     for _ in range(max_len - 1):
         memory = memory.to(cfg.device)
         tgt_mask = create_square_mask(ys.size(0)).type(torch.bool).to(cfg.device)
@@ -166,13 +177,10 @@ def greedy_decode(
     return ys
 
 
-def translate(
-    model: nn.Module, vocab: Vocab, transform: Transform, sentence: tp.Union[str, list[str]]
-):
+def translate(model: nn.Module, vocab: Vocab, transform: Transform, sentence: tp_Instrs) -> str:
     """Translate input sentence into target language."""
     model.eval()
-    sentence = " ".join(sentence) if isinstance(sentence, list) else sentence
-    src = transform(sentence).view(-1, 1)
+    src = transform(sentence).view(-1, 1)  # adds a second dimension
     num_tokens = src.shape[0]
     src_mask = torch.zeros(num_tokens, num_tokens).type(torch.bool)
     tgt_tokens = greedy_decode(model, src, src_mask, max_len=num_tokens + 5).flatten()
@@ -191,7 +199,6 @@ def main() -> None:
     ]
     # Vocab
     vocab = get_vocab((m + b for m, b in tr_dataset.stream_tokenized_flattened_snippets()))
-    pprint(vocab.get_itos()[0:20] + ["......"] + vocab.get_itos()[-20:])
     # Convert raw strings into tensors indices
     collate_fn = CollateFunction(vocab)
     # Model
@@ -203,6 +210,8 @@ def main() -> None:
         if p.dim() > 1:
             nn.init.xavier_uniform_(p)
     models_path = MODELS_ROOT / ""
+    if CLEAN:
+        shutil.rmtree(models_path)
     models_path.mkdir(exist_ok=True, parents=True)
     saved_models = list(models_path.iterdir())
     latest = 0
@@ -214,11 +223,23 @@ def main() -> None:
         transformer.load_state_dict(state, strict=False)
     transformer = transformer.to(cfg.device)
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=cfg.PAD_IDX)
-    # Train
-    train(transformer, models_path, tr_dataset, vl_dataset, loss_fn, collate_fn, latest)
-    # Evaluate
-    evaluate(transformer, ts_dataset, loss_fn, collate_fn)
-    # Infer
+    # Training
+    if latest < EPOCHS - 1:
+        print("Training...")
+        train(transformer, models_path, tr_dataset, vl_dataset, loss_fn, collate_fn, latest)
+    # Testing
+    if EVAL_TS:
+        print("Testing...")
+        s = timer()
+        ts_loss = evaluate(
+            transformer,
+            DataLoader(ts_dataset, BATCH_SIZE, collate_fn=collate_fn),
+            loss_fn,
+            ts_dataset.est_len,
+        )
+        ts_time = timer() - s
+        print(f"Test loss: {ts_loss:.3f}, " f"Test time = {ts_time / 60:.3f}min, ")
+    # Inference
     src_text = [
         "mov rbp rdi",
         "mov ebx 0x1",
@@ -228,25 +249,30 @@ def main() -> None:
         "mov rcx rax",
         "mov [rax] 0x2e",
     ]
-    translate(transformer, vocab, collate_fn.transform, src_text)
+    tgt_text = translate(transformer, vocab, collate_fn.transform, src_text)
+    print(tgt_text)
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument(
-        "--device", type=str, default="cuda:1" if torch.cuda.is_available() else "cpu"
-    )
+    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--vocabs_root", type=Path, default=Path("./vocabs"))
     parser.add_argument("--models_root", type=Path, default=Path("./models"))
+    parser.add_argument("--no_eval_ts", action="store_true")
+    parser.add_argument("--no_eval_vl", action="store_true")
+    parser.add_argument("--clean", action="store_true")
     args = parser.parse_args()
 
     cfg.init(args.device, 0)
-    BATCH_SIZE = args.batch_size
-    EPOCHS = args.epochs
-    VOCAB_ROOT = Path(args.vocabs_root)
-    MODELS_ROOT = Path(args.models_root)
+    BATCH_SIZE: int = args.batch_size
+    EPOCHS: int = args.epochs
+    VOCAB_ROOT: Path = args.vocabs_root
+    MODELS_ROOT: Path = args.models_root
+    EVAL_TS: bool = not args.no_eval_ts
+    EVAL_VL: bool = not args.no_eval_vl
+    CLEAN: bool = args.clean
 
     SUMMARY_FILES = [
         Path(
